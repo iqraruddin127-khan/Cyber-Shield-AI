@@ -1,0 +1,12 @@
+fastapi
+uvicorn
+streamlit
+requests
+opencv-python
+numpy
+joblib
+scikit-learn
+supabase
+python-dotenv
+xgboost
+dashscope
