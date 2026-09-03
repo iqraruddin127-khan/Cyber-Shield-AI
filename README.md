@@ -117,6 +117,29 @@ python -m streamlit run dashboard.py --server.port 8501
 
 Open **http://localhost:8501** in your browser.
 
+## Deploy to Streamlit Cloud
+
+The app supports **standalone cloud mode** — no FastAPI backend needed. ML inference and heuristic scanning run directly inside the Streamlit app.
+
+### Steps
+
+1. Push this repository to GitHub
+2. Go to [share.streamlit.io](https://share.streamlit.io) and sign in with GitHub
+3. Click **New app** and configure:
+   - **Repository:** `your-username/cybershield-ai`
+   - **Branch:** `main`
+   - **Main file path:** `dashboard.py`
+4. Click **Advanced settings** → **Secrets** and add:
+   ```toml
+   SUPABASE_URL = "https://your-project.supabase.co"
+   SUPABASE_ANON_KEY = "your-anon-key"
+   DASHSCOPE_API_KEY = "sk-your-key-here"
+   STANDALONE_MODE = "1"
+   ```
+5. Click **Deploy** — Streamlit Cloud will install dependencies and launch the app
+
+> **Note:** ML model files (`.pkl`) are not included in the repo. On Streamlit Cloud, the app falls back to heuristic-based detection. For full ML accuracy, deploy locally with the `Models/` directory.
+
 ## API Endpoints
 
 | Endpoint | Method | Description |
@@ -156,10 +179,11 @@ The `extension/` folder contains a Manifest V3 Chrome extension for scanning any
 
 ## Security Notes
 
-- **All scanning runs locally** — your data never leaves your machine
-- **No secrets in code** — all credentials loaded from environment variables
+- **All scanning runs locally** — your data never leaves your machine (or the Streamlit Cloud instance)
+- **No secrets in code** — all credentials loaded from environment variables or Streamlit secrets
 - **Session persistence** — Supabase auth with automatic token refresh
 - **ML model fallback** — keyword heuristics when models are unavailable
+- **Cloud-ready** — standalone mode works without a separate backend server
 
 ## Contributing
 

@@ -2,11 +2,10 @@ fastapi
 uvicorn
 streamlit
 requests
-opencv-python
+opencv-python-headless
 numpy
 joblib
 scikit-learn
 supabase
 python-dotenv
 xgboost
-dashscope

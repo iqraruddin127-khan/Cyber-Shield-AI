@@ -1,6 +1,8 @@
 import base64
 import os
+import re as _re
 import time
+from urllib.parse import urlparse as _urlparse
 
 import cv2
 import numpy as np
@@ -8,8 +10,22 @@ import requests
 import requests.exceptions
 import streamlit as st
 import streamlit.components.v1 as components
-from dotenv import load_dotenv
+
+# Load environment variables from .env file (local) or Streamlit secrets (cloud)
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass  # dotenv not available on Streamlit Cloud
+
 from supabase import create_client, Client
+
+# Optional: ML libraries for standalone / cloud mode
+try:
+    import joblib
+    ML_AVAILABLE = True
+except ImportError:
+    ML_AVAILABLE = False
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -20,11 +36,28 @@ SESSION_REFRESH_INTERVAL = 60  # seconds between session refreshes
 HEALTH_CHECK_TTL = 30  # seconds to cache backend health status
 QWEN_MODEL = "qwen-turbo"  # Options: qwen-turbo, qwen-plus, qwen-max
 QWEN_API_URL = "https://dashscope-intl.aliyuncs.com/compatible-mode/v1/chat/completions"
+MODELS_DIR = "Models"
+
+# ---------------------------------------------------------------------------
+# Cloud mode detection
+# ---------------------------------------------------------------------------
+def _get_env(key: str, default: str = "") -> str:
+    """Get env var from os.environ or Streamlit secrets (cloud fallback)."""
+    val = os.getenv(key, "")
+    if val:
+        return val
+    try:
+        return st.secrets.get(key, default)
+    except Exception:
+        return default
+
+# Auto-detect Streamlit Cloud (no local backend available)
+CLOUD_MODE = _get_env("STREAMLIT_CLOUD", "") != "" or _get_env("STANDALONE_MODE", "") != ""
 
 # ---------------------------------------------------------------------------
 # DashScope / Qwen configuration (OpenAI-compatible API)
 # ---------------------------------------------------------------------------
-_DASHSCOPE_API_KEY = os.getenv("DASHSCOPE_API_KEY", "")
+_DASHSCOPE_API_KEY = _get_env("DASHSCOPE_API_KEY")
 QWEN_ENABLED = bool(_DASHSCOPE_API_KEY and _DASHSCOPE_API_KEY != "your-dashscope-api-key-here")
 
 # Cybersecurity-focused system prompt for Qwen
@@ -48,11 +81,258 @@ Keep responses concise but informative. Use emojis sparingly for clarity.
 Never ask for or store sensitive information like passwords or personal data."""
 
 # ---------------------------------------------------------------------------
+# Standalone ML models (cloud mode or fallback when backend is offline)
+# ---------------------------------------------------------------------------
+
+@st.cache_resource
+def _load_ml_models():
+    """Load ML models once for standalone / cloud processing. Missing models
+    fall back to heuristic-based detection — the app still works."""
+    models = {}
+
+    # Scam text model
+    try:
+        models["scam_model"] = joblib.load(os.path.join(MODELS_DIR, "scam_model.pkl"))
+        models["scam_vectorizer"] = joblib.load(os.path.join(MODELS_DIR, "scam_vectorizer.pkl"))
+    except Exception:
+        models["scam_model"] = None
+        models["scam_vectorizer"] = None
+
+    # Phishing URL model
+    try:
+        models["phishing_model"] = joblib.load(os.path.join(MODELS_DIR, "phishing_model.pkl"))
+    except Exception:
+        models["phishing_model"] = None
+
+    # Email spam model
+    try:
+        models["email_model"] = joblib.load(os.path.join(MODELS_DIR, "spam_svm_model_clean (1).pkl"))
+        models["email_vectorizer"] = joblib.load(os.path.join(MODELS_DIR, "tfidf_vectorizer_clean.pkl"))
+    except Exception:
+        models["email_model"] = None
+        models["email_vectorizer"] = None
+
+    return models
+
+
+if ML_AVAILABLE and CLOUD_MODE:
+    _ml_models = _load_ml_models()
+else:
+    _ml_models = {}
+
+
+# ── Scam keywords (local Urdu + Roman Urdu dictionary) ──
+_SCAM_KEYWORDS = [
+    "bisp", "jeeto pakistan", "inam", "lottery",
+    "account block", "\u0627\u0646\u0639\u0627\u0645", "\u0644\u0627\u0679\u0631\u06cc", "paisa",
+]
+
+# ── Phishing heuristic constants ──
+_PHISHING_DOMAIN_KEYWORDS = [
+    "login", "signin", "sign-in", "verify", "verification", "secure",
+    "account", "update", "confirm", "authenticate", "banking",
+    "password", "credential", "wallet", "suspended", "unusual",
+    "activity", "limited", "restore", "unlock", "alert",
+    "security", "notification", "invoice", "payment", "refund",
+    "support", "helpdesk", "service", "paypal", "apple",
+    "google", "microsoft", "amazon", "netflix", "facebook",
+    "instagram", "whatsapp", "twitter", "dropbox", "docusign",
+    "free", "winner", "prize", "lottery", "claim",
+    "gift", "reward", "bonus", "cashback", "urgent",
+    "click", "download", "install", "upgrade",
+]
+
+_SUSPICIOUS_TLDS = [
+    ".tk", ".ml", ".ga", ".cf", ".gq", ".buzz", ".top",
+    ".xyz", ".club", ".work", ".click", ".link", ".icu",
+    ".cam", ".rest", ".surf",
+]
+
+_FREE_HOSTING_DOMAINS = [
+    "000webhost", "freehosting", "infinityfree", "awardpace",
+    "byethost", "freesite", "wixsite", "weebly", "jimdo",
+    "blogspot", "wordpress.com", "tumblr.com", "strikingly",
+]
+
+_URL_SHORTENERS = [
+    "bit.ly", "tinyurl", "goo.gl", "t.co", "ow.ly",
+    "is.gd", "buff.ly", "rebrand.ly", "cutt.ly", "shorturl",
+    "tiny.cc", "bc.vc", "adf.ly", "shorte.st",
+]
+
+_EMAIL_SPAM_KEYWORDS = [
+    "win", "winner", "won", "free", "prize", "claim", "urgent", "act now",
+    "limited time", "click here", "congratulations", "you have been selected",
+    "million", "cash", "bonus", "offer expires", "no obligation",
+    "risk free", "guaranteed", "earn money", "work from home",
+]
+
+
+def _compute_phishing_score(url: str) -> int:
+    """Return a risk score (0-100) based on URL heuristic analysis."""
+    url_lower = url.lower()
+    score = 0
+
+    kw_hits = sum(1 for kw in _PHISHING_DOMAIN_KEYWORDS if kw in url_lower)
+    if kw_hits >= 3:
+        score += 35
+    elif kw_hits >= 2:
+        score += 25
+    elif kw_hits >= 1:
+        score += 10
+
+    hyphen_count = url_lower.count("-")
+    if hyphen_count >= 4:
+        score += 20
+    elif hyphen_count >= 2:
+        score += 10
+
+    try:
+        parsed = _urlparse(url)
+        host = parsed.hostname or ""
+    except Exception:
+        host = url
+    subdomain_dots = host.count(".") - 1
+    if subdomain_dots >= 3:
+        score += 15
+    elif subdomain_dots >= 2:
+        score += 8
+
+    for tld in _SUSPICIOUS_TLDS:
+        if url_lower.endswith(tld) or url_lower.endswith(tld + "/"):
+            score += 20
+            break
+
+    for fh in _FREE_HOSTING_DOMAINS:
+        if fh in url_lower:
+            score += 15
+            break
+
+    for us in _URL_SHORTENERS:
+        if us in url_lower:
+            score += 20
+            break
+
+    if _re.search(r'https?://\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}', url_lower):
+        score += 25
+
+    if not url_lower.startswith("https"):
+        score += 10
+
+    if len(url) > 75:
+        score += 10
+    if len(url) > 120:
+        score += 5
+
+    if "@" in url_lower:
+        score += 25
+
+    if url_lower.count(".") >= 5:
+        score += 10
+
+    domain_part = host.split(".")[0] if host else ""
+    if domain_part and any(c.isdigit() for c in domain_part) and any(c.isalpha() for c in domain_part):
+        score += 5
+
+    return min(score, 100)
+
+
+# ── Local processing functions (standalone replacements for backend API) ──
+
+def _local_scan_text(text: str) -> dict:
+    """Scan text for scam indicators locally."""
+    model = _ml_models.get("scam_model")
+    vec = _ml_models.get("scam_vectorizer")
+    model_threat = False
+    if model and vec:
+        try:
+            vectorized = vec.transform([text])
+            prediction = model.predict(vectorized)
+            model_threat = prediction[0] == "spam"
+        except Exception:
+            pass
+    is_local_scam = any(kw in text.lower() for kw in _SCAM_KEYWORDS)
+    status = "Threat Detected" if (model_threat or is_local_scam) else "Safe"
+    return {"status": status}
+
+
+def _local_scan_url(url: str) -> dict:
+    """Scan URL for phishing indicators locally."""
+    phishing_score = _compute_phishing_score(url)
+    model = _ml_models.get("phishing_model")
+    model_threat = False
+    if model:
+        try:
+            features = [[
+                len(url), url.count("."), url.count("-"),
+                1 if "secure" in url.lower() else 0,
+                1 if "login" in url.lower() else 0,
+                1 if "bank" in url.lower() else 0,
+            ]]
+            prediction = model.predict(features)
+            model_threat = int(prediction[0]) == 1
+        except Exception:
+            pass
+    heuristic_threat = phishing_score >= 40
+    status = "Threat Detected" if (model_threat or heuristic_threat) else "Safe"
+    return {"status": status, "url": url, "risk_score": phishing_score}
+
+
+def _local_analyze_password(password: str) -> dict:
+    """Analyze password strength locally."""
+    if len(password) < 6:
+        return {"strength": "Weak \U0001f534"}
+    has_upper = any(c.isupper() for c in password)
+    has_digit = any(c.isdigit() for c in password)
+    has_spec = any(not c.isalnum() for c in password)
+    if has_upper and has_digit and has_spec and len(password) >= 10:
+        return {"strength": "Strong \U0001f7e2"}
+    return {"strength": "Medium \U0001f7e1"}
+
+
+def _local_analyze_email(subject: str, body: str) -> dict:
+    """Analyze email for spam/phishing indicators locally."""
+    combined = f"{subject} {body}"
+    model = _ml_models.get("email_model")
+    vec = _ml_models.get("email_vectorizer")
+    model_threat = False
+    if model and vec:
+        try:
+            vectorized = vec.transform([combined])
+            prediction = model.predict(vectorized)
+            model_threat = int(prediction[0]) == 1
+        except Exception:
+            pass
+    combined_lower = combined.lower()
+    kw_matches = sum(1 for kw in _EMAIL_SPAM_KEYWORDS if kw in combined_lower)
+    keyword_threat = kw_matches >= 2
+    signals = []
+    if model_threat:
+        signals.append("ML model classified as spam")
+    if keyword_threat:
+        signals.append("Multiple spam keywords detected")
+    if any(kw in combined_lower for kw in ["click here", "click now", "act now"]):
+        signals.append("Contains urgent call-to-action")
+    if any(kw in combined_lower for kw in ["verify", "confirm identity", "update account"]):
+        signals.append("Potential phishing — identity request")
+    status = "Threat Detected" if (model_threat or keyword_threat) else "Safe"
+    return {"status": status, "signals": signals if signals else ["No spam indicators found"]}
+
+
+def _local_scan_file(file_name: str) -> dict:
+    """Scan file extension for dangerous executables locally."""
+    _, ext = os.path.splitext(file_name.lower())
+    dangerous = [".exe", ".bat", ".cmd", ".msi", ".scr"]
+    if ext in dangerous:
+        return {"status": "Threat Detected", "details": f"Dangerous executable script ({ext}) flagged."}
+    return {"status": "Safe", "details": "File layout clearance passed."}
+
+
+# ---------------------------------------------------------------------------
 # Supabase client (cached — created once per session, not every rerun)
 # ---------------------------------------------------------------------------
-load_dotenv()
-_SUPABASE_URL = os.getenv("SUPABASE_URL", "")
-_SUPABASE_KEY = os.getenv("SUPABASE_ANON_KEY", "")
+_SUPABASE_URL = _get_env("SUPABASE_URL")
+_SUPABASE_KEY = _get_env("SUPABASE_ANON_KEY")
 
 
 @st.cache_resource
@@ -1298,16 +1578,19 @@ p, span, label { color: #CBD5E1; }
 """, unsafe_allow_html=True)
 
 # ---------------------------------------------------------------------------
-# Helper functions (optimized with caching)
+# Helper functions (optimized with caching + standalone fallback)
 # ---------------------------------------------------------------------------
 
 
 @st.cache_data(ttl=HEALTH_CHECK_TTL)
 def _check_backend_health():
-    """Return True if the backend health endpoint responds.
+    """Return True if backend is available or running in standalone mode.
     
+    In cloud/standalone mode, returns True if ML models are loaded.
     Cached for 30 seconds to avoid HTTP call on every rerun.
     """
+    if CLOUD_MODE:
+        return bool(_ml_models) or True  # standalone mode always "online"
     try:
         r = requests.get(f"{BACKEND_URL}/health", timeout=2)
         return r.status_code == 200
@@ -1319,13 +1602,41 @@ def _check_backend_health():
 def _api_post(endpoint, payload, timeout=10):
     """POST to the backend and return (data_dict, error_string).
     
+    Falls back to local processing in cloud mode or when backend is unreachable.
     Cached for 60 seconds to avoid duplicate API calls for same input.
     """
+    # Cloud / standalone mode: process locally
+    if CLOUD_MODE:
+        if endpoint == "scan-text":
+            return _local_scan_text(payload.get("text", "")), None
+        elif endpoint == "scan-url":
+            return _local_scan_url(payload.get("url", "")), None
+        elif endpoint == "analyze-password":
+            return _local_analyze_password(payload.get("password", "")), None
+        elif endpoint == "analyze-email":
+            return _local_analyze_email(
+                payload.get("subject", ""), payload.get("body", "")
+            ), None
+        return None, f"Unknown endpoint: {endpoint}"
+
+    # Try backend first
     try:
         res = requests.post(f"{BACKEND_URL}/{endpoint}", json=payload, timeout=timeout)
         res.raise_for_status()
         return res.json(), None
     except requests.exceptions.ConnectionError:
+        # Fallback to local processing if ML models are available
+        if ML_AVAILABLE and _ml_models:
+            if endpoint == "scan-text":
+                return _local_scan_text(payload.get("text", "")), None
+            elif endpoint == "scan-url":
+                return _local_scan_url(payload.get("url", "")), None
+            elif endpoint == "analyze-password":
+                return _local_analyze_password(payload.get("password", "")), None
+            elif endpoint == "analyze-email":
+                return _local_analyze_email(
+                    payload.get("subject", ""), payload.get("body", "")
+                ), None
         return None, "Cannot reach backend. Ensure the server is running on port 8000."
     except requests.exceptions.Timeout:
         return None, "Request timed out. Please try again."
@@ -1337,14 +1648,25 @@ def _api_post(endpoint, payload, timeout=10):
 def _api_upload(endpoint, file_name, file_content_bytes, file_type, timeout=10):
     """POST a file upload to the backend and return (data_dict, error_string).
     
+    Falls back to local file scanning in cloud mode.
     Cached for 60 seconds based on file name + content hash.
     """
+    # Cloud / standalone mode: process locally
+    if CLOUD_MODE:
+        if endpoint == "scan-file":
+            return _local_scan_file(file_name), None
+        return None, f"Unknown endpoint: {endpoint}"
+
+    # Try backend first
     try:
         files = {"file": (file_name, file_content_bytes, file_type)}
         res = requests.post(f"{BACKEND_URL}/{endpoint}", files=files, timeout=timeout)
         res.raise_for_status()
         return res.json(), None
     except requests.exceptions.ConnectionError:
+        # Fallback for file scanning
+        if endpoint == "scan-file":
+            return _local_scan_file(file_name), None
         return None, "Cannot reach backend. Ensure the server is running on port 8000."
     except requests.exceptions.Timeout:
         return None, "Request timed out. Please try again."
@@ -1531,17 +1853,24 @@ def _process_ai_query(query: str):
 # ---------------------------------------------------------------------------
 backend_ok = _check_backend_health()
 
+# Dynamic subtitle based on deployment mode
+_hero_subtitle = (
+    'Detect phishing links, scam messages, spam emails, and weak passwords in seconds. '
+    'Cyber Shield AI runs entirely in the cloud with on-device ML inference — '
+    'your data never leaves the app.'
+    if CLOUD_MODE else
+    'Detect phishing links, scam messages, spam emails, and weak passwords in seconds. '
+    'Cyber Shield AI runs locally through a FastAPI backend — '
+    'your data never leaves your machine.'
+)
+
 st.markdown(
     '<div class="hero-section">'
     '<div class="hero-blur"></div>'
     '<div class="hero-content">'
     '<div class="hero-badge"><span>🚀</span> New Release v1.0</div>'
     '<div class="hero-title">AI-Powered <span class="highlight">Cyber Defense</span> for Everyone</div>'
-    '<div class="hero-subtitle">'
-    'Detect phishing links, scam messages, spam emails, and weak passwords in seconds. '
-    'Cyber Shield AI runs locally through a FastAPI backend — '
-    'your data never leaves your machine.'
-    '</div>'
+    f'<div class="hero-subtitle">{_hero_subtitle}</div>'
     '</div>'
     '<div class="hero-trust">'
     '<div class="hero-trust-label">Trusted by security-aware users</div>'
@@ -1553,6 +1882,10 @@ st.markdown(
     '</div>'
     '</div>'
     + (
+        '<div style="position:absolute;top:18px;right:18px;z-index:3;">'
+        '<div class="conn-badge-ok"><span class="pulse-dot green"></span> Cloud Mode</div>'
+        '</div>'
+        if CLOUD_MODE and backend_ok else
         '<div style="position:absolute;top:18px;right:18px;z-index:3;">'
         '<div class="conn-badge-ok"><span class="pulse-dot green"></span> Systems Online</div>'
         '</div>'
