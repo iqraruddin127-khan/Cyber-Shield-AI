@@ -54,6 +54,11 @@ def _get_env(key: str, default: str = "") -> str:
 # Auto-detect Streamlit Cloud (no local backend available)
 CLOUD_MODE = _get_env("STREAMLIT_CLOUD", "") != "" or _get_env("STANDALONE_MODE", "") != ""
 
+# Supabase email confirmation redirect URL
+# Set REDIRECT_URL in .env (local) or Streamlit secrets (cloud)
+# e.g. REDIRECT_URL=https://your-app.streamlit.app
+REDIRECT_URL = _get_env("REDIRECT_URL", "http://localhost:8501")
+
 # ---------------------------------------------------------------------------
 # DashScope / Qwen configuration (OpenAI-compatible API)
 # ---------------------------------------------------------------------------
@@ -569,7 +574,7 @@ def _render_auth_page():
                             "email":    signup_email,
                             "password": signup_pass,
                             "options": {
-                                "email_redirect_to": "http://localhost:8501",
+                                "email_redirect_to": REDIRECT_URL,
                             },
                         })
                         # Insert profile row
