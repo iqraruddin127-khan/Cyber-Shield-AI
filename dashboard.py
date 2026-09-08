@@ -492,6 +492,24 @@ def _render_auth_page():
         box-shadow: 0 10px 28px rgba(6,182,212,0.45) !important;
     }
     </style>
+    <script>
+    (function(){
+      function fixAutocomplete(){
+        var inputs=document.querySelectorAll('input[type="password"]');
+        inputs.forEach(function(inp,i){
+          if(i===0) inp.setAttribute('autocomplete','current-password');
+          else if(i===1) inp.setAttribute('autocomplete','new-password');
+          else if(i===2) inp.setAttribute('autocomplete','new-password');
+        });
+        var emailInputs=document.querySelectorAll('input[type="email"], input[placeholder*="example.com"], input[placeholder*="@example"]');
+        emailInputs.forEach(function(inp,i){
+          inp.setAttribute('autocomplete', i===0 ? 'username' : 'email');
+        });
+      }
+      fixAutocomplete();
+      new MutationObserver(fixAutocomplete).observe(document.body,{childList:true,subtree:true});
+    })();
+    </script>
     """, unsafe_allow_html=True)
 
     # ── Brand header ───────────────────────────────────────────────────────
@@ -512,13 +530,13 @@ def _render_auth_page():
 
         # ── LOGIN ──────────────────────────────────────────────────────────
         with login_tab:
-            st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
+            st.markdown("<div style='height:6px'></div>", unsafe_allow_html=True)
             login_email = st.text_input("Email address", key="login_email",
                                         placeholder="you@example.com")
             login_pass  = st.text_input("Password", type="password",
                                         key="login_pass",
                                         placeholder="Your password")
-            st.markdown("<div style='height:4px'></div>", unsafe_allow_html=True)
+            st.markdown("<div style='height:2px'></div>", unsafe_allow_html=True)
             st.markdown('<div class="auth-primary-btn">', unsafe_allow_html=True)
             sign_in_clicked = st.button("Sign In", key="_signin",
                                         use_container_width=True)
@@ -541,55 +559,46 @@ def _render_auth_page():
                         else:
                             st.error(f"Login failed: {msg}")
 
-        # ── SIGNUP ─────────────────────────────────────────────────────────
+        # ── SIGNUP ────────────────────────────────────────────────────────
         with signup_tab:
-            st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
-            signup_name  = st.text_input("Full name", key="signup_name",
-                                         placeholder="Jane Smith")
-            signup_email = st.text_input("Email address", key="signup_email",
-                                         placeholder="you@example.com")
-            signup_pass  = st.text_input("Password (min 8 characters)",
-                                         type="password", key="signup_pass",
-                                         placeholder="Choose a strong password")
-            signup_pass2 = st.text_input("Confirm password", type="password",
-                                         key="signup_pass2",
-                                         placeholder="Repeat your password")
-            st.markdown("<div style='height:4px'></div>", unsafe_allow_html=True)
+            st.markdown("<div style='height:6px'></div>", unsafe_allow_html=True)
+            _signup_name   = st.text_input("Full Name", key="_signup_name", placeholder="Jane Smith")
+            _signup_email  = st.text_input("Email Address", key="_signup_email", placeholder="you@example.com")
+            _signup_pass   = st.text_input("Password", key="_signup_pass", type="password", help="Use 8+ characters with uppercase letters and numbers.")
+            _signup_pass2  = st.text_input("Repeat Password", key="_signup_pass2", type="password", placeholder="Re-enter your password")
+            st.markdown("<div style='height:2px'></div>", unsafe_allow_html=True)
             st.markdown('<div class="auth-primary-btn">', unsafe_allow_html=True)
-            sign_up_clicked = st.button("Create Account", key="_signup",
-                                        use_container_width=True)
+            signup_clicked = st.button("Create Account", key="_signup_btn", use_container_width=True, type="primary")
             st.markdown("</div>", unsafe_allow_html=True)
 
-            if sign_up_clicked:
-                # Client-side validation
-                if not signup_name or not signup_email or not signup_pass:
+            if signup_clicked:
+                if not _signup_name or not _signup_email or not _signup_pass or not _signup_pass2:
                     st.error("All fields are required.")
-                elif len(signup_pass) < 8:
-                    st.error("Password must be at least 8 characters long.")
-                elif signup_pass != signup_pass2:
+                elif _signup_pass != _signup_pass2:
                     st.error("Passwords do not match.")
+                elif len(_signup_pass) < 8:
+                    st.error("Password must be at least 8 characters long.")
                 else:
                     try:
                         resp = supabase.auth.sign_up({
-                            "email":    signup_email,
-                            "password": signup_pass,
+                            "email":    _signup_email,
+                            "password": _signup_pass,
                             "options": {
                                 "email_redirect_to": REDIRECT_URL,
                             },
                         })
-                        # Insert profile row
                         if resp.user:
                             try:
                                 supabase.table("profiles").insert({
                                     "id":         resp.user.id,
-                                    "full_name":  signup_name,
-                                    "email":      signup_email,
+                                    "full_name":  _signup_name,
+                                    "email":      _signup_email,
                                 }).execute()
                             except Exception:
-                                pass  # Non-fatal — profile can be created later
+                                pass
                         st.success(
-                            "Account created! Check your email to confirm your "
-                            "address, then sign in."
+                            "Account created! Check your email to confirm "
+                            "your address, then sign in."
                         )
                     except Exception as exc:
                         msg = str(exc)
